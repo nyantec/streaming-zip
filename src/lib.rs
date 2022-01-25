@@ -229,6 +229,13 @@ impl<W: Write> Archive<W> {
         Ok(())
     }
 
+    pub fn add_file_from_path<R: AsRef<Path>, S: AsRef<Path>>(&mut self, path: R, src_path: S, compression: CompressionMode) -> Result<()> {
+        let mut file = File::open(src_path)?;
+        let modified = DateTime::<Utc>::from(file.metadata()?.modified()?).naive_local();
+        self.add_file(path.as_ref().to_path_buf().into_os_string().into_vec(), modified, compression, &mut file)?;
+        Ok(())
+    }
+
     pub fn add_dir_all<R: AsRef<Path>, S: AsRef<Path>>(&mut self, path: R, src_path: S, compression: CompressionMode) -> Result<()> {
         let mut stack = vec![(src_path.as_ref().to_path_buf(), None)];
         while let Some((src, modified_if_file)) = stack.pop() {
