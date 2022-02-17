@@ -71,13 +71,8 @@ impl FileHeader {
         }
         handle.write_all(&10u16.to_le_bytes())?; // Version needed to extract (minimum) => 1.0
         written += 2;
-        if self.data_descriptor.is_some() {
-            handle.write_all(&0b0000_0000u16.to_le_bytes())?; // General purpose bit flag
-            written += 2;
-        } else {
-            handle.write_all(&0b0000_1000u16.to_le_bytes())?; // General purpose bit flag => enable data descriptors
-            written += 2;
-        }
+        handle.write_all(&0b0000_1000u16.to_le_bytes())?; // General purpose bit flag => enable data descriptor
+        written += 2;
         let compression_num: u16 = match self.compression {
             CompressionMode::Store => 0,
             CompressionMode::Deflate(_) => 8,
