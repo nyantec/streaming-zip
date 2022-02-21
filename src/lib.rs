@@ -13,7 +13,7 @@ use chrono::DateTime;
 use chrono::offset::Utc;
 use chrono::Datelike;
 use chrono::Timelike;
-use crc::Crc;
+use crc::{Crc, Digest};
 use miniz_oxide::deflate::core::CompressorOxide;
 use miniz_oxide::deflate::stream::deflate;
 use miniz_oxide::MZFlush;
@@ -166,6 +166,10 @@ pub struct Archive<W: Write> {
     files: Vec<FileHeader>,
     written: usize,
     inner: W,
+    intermediate_digest: Option<Digest<'static, u32>>,
+    intermediate_compressor: Option<CompressorOxide>,
+    intermediate_uncompressed_size: u64,
+    intermediate_compressed_size: u64
 }
 
 impl<W: Write> Archive<W> {
@@ -176,7 +180,117 @@ impl<W: Write> Archive<W> {
             files: Vec::new(),
             written: 0,
             inner,
+            intermediate_digest: None,
+            intermediate_compressor: None,
+            intermediate_uncompressed_size: 0,
+            intermediate_compressed_size: 0,
         }
+    }
+
+    pub fn start_new_file(&mut self, name: Vec<u8>, last_modified: NaiveDateTime, compression: CompressionMode, use_zip64: bool) -> Result<()> {
+        let file = FileHeader {
+            name,
+            last_modified,
+            data_descriptor: None,
+            file_header_start: self.written as u64,
+            compression,
+            is_zip64: use_zip64 || self.written > (u32::MAX as usize)
+        };
+        self.written += file.write(&mut self.inner, false)?;
+        self.files.push(file);
+        self.intermediate_digest = Some(CRC32.digest());
+        match compression {
+            CompressionMode::Store => self.intermediate_compressor = None,
+            CompressionMode::Deflate(level) => {
+                let mut compressor = CompressorOxide::default();
+                compressor.set_format_and_level(DataFormat::Raw, level);
+                self.intermediate_compressor = Some(compressor);
+            }
+        }
+        self.intermediate_uncompressed_size = 0;
+        self.intermediate_compressed_size = 0;
+
+        Ok(())
+    }
+
+    pub fn append_data(&mut self, content: &[u8]) -> Result<()> {
+        match self.intermediate_compressor {
+            Some(_) => self.append_data_deflate(content),
+            None => self.append_data_store(content),
+        }
+    }
+
+    pub fn finish_file(&mut self) -> Result<()> {
+        if self.intermediate_compressor.is_some() {
+            self.finish_data_deflate()?;
+            self.intermediate_compressor = None;
+        }
+        let digest = self.intermediate_digest.take().ok_or(Error::new(ErrorKind::InvalidData, "missing digest"))?;
+        let crc = digest.finalize();
+        let dd = DataDescriptor {
+            crc,
+            uncompressed_size: self.intermediate_uncompressed_size,
+            compressed_size: self.intermediate_compressed_size,
+        };
+        let file = self.files.last_mut().ok_or(Error::new(ErrorKind::InvalidData, "missing file header"))?;
+        self.written += dd.write(&mut self.inner, true, file.is_zip64, false)?;
+        file.data_descriptor = Some(dd);
+
+        Ok(())
+    }
+
+    fn append_data_deflate(&mut self, content: &[u8]) -> Result<()> {
+        let compressor = self.intermediate_compressor.as_mut().unwrap();
+        let digest = self.intermediate_digest.as_mut().ok_or(Error::new(ErrorKind::InvalidData, "missing digest"))?;
+        digest.update(content);
+        self.intermediate_uncompressed_size += content.len() as u64;
+
+        let mut in_buf = content;
+        loop {
+            let res = deflate(compressor, in_buf, &mut self.compressed_buf, MZFlush::None);
+            match res.status {
+                Ok(MZStatus::Ok) => (),
+                Ok(status) => return Err(Error::new(ErrorKind::Other, format!("deflate unexpected status: {:?}", status))),
+                Err(status) => return Err(Error::new(ErrorKind::Other, format!("deflate error: {:?}", status))),
+            }
+
+            self.intermediate_compressed_size += res.bytes_written as u64;
+            self.inner.write_all(&self.compressed_buf[..res.bytes_written])?;
+            self.written += res.bytes_written;
+            in_buf = &in_buf[res.bytes_consumed..];
+            if in_buf.len() == 0 { break; }
+        }
+
+        Ok(())
+    }
+
+    fn finish_data_deflate(&mut self) -> Result<()> {
+        loop {
+            let compressor = self.intermediate_compressor.as_mut().unwrap();
+            let res = deflate(compressor, &[], &mut self.compressed_buf, MZFlush::Finish);
+            let status = match res.status {
+                Ok(MZStatus::Ok) => MZStatus::Ok,
+                Ok(MZStatus::StreamEnd) => MZStatus::StreamEnd,
+                Ok(status) => return Err(Error::new(ErrorKind::Other, format!("deflate unexpected status: {:?}", status))),
+                Err(status) => return Err(Error::new(ErrorKind::Other, format!("deflate error: {:?}", status))),
+            };
+            self.intermediate_compressed_size += res.bytes_written as u64;
+            self.inner.write_all(&self.compressed_buf[..res.bytes_written])?;
+            self.written += res.bytes_written;
+            if let MZStatus::StreamEnd = status { break; }
+        }
+
+        Ok(())
+    }
+
+    fn append_data_store(&mut self, content: &[u8]) -> Result<()> {
+        let digest = self.intermediate_digest.as_mut().ok_or(Error::new(ErrorKind::InvalidData, "missing digest"))?;
+        digest.update(content);
+        self.intermediate_uncompressed_size += content.len() as u64;
+        self.intermediate_compressed_size += content.len() as u64;
+        self.inner.write_all(&content)?;
+        self.written += content.len();
+        Ok(())
     }
 
     fn write_data_deflate<R: Read>(&mut self, content: &mut R, level: u8) -> Result<DataDescriptor> {
