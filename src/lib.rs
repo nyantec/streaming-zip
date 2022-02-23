@@ -161,7 +161,6 @@ pub enum CompressionMode {
 }
 
 pub struct Archive<W: Write> {
-    buf: [u8; 4096],
     compressed_buf: [u8; 4096],
     files: Vec<FileHeader>,
     written: usize,
@@ -175,7 +174,6 @@ pub struct Archive<W: Write> {
 impl<W: Write> Archive<W> {
     pub fn new(inner: W) -> Archive<W> {
         Archive {
-            buf: [0; 4096],
             compressed_buf: [0; 4096],
             files: Vec::new(),
             written: 0,
@@ -293,94 +291,24 @@ impl<W: Write> Archive<W> {
         Ok(())
     }
 
-    fn write_data_deflate<R: Read>(&mut self, content: &mut R, level: u8) -> Result<DataDescriptor> {
-        let mut compressor = CompressorOxide::default();
-        compressor.set_format_and_level(DataFormat::Raw, level);
-        let mut digest = CRC32.digest();
-        let mut uncompressed_size = 0u64;
-        let mut compressed_size = 0u64;
-        while let Ok(len) = content.read(&mut self.buf) {
-            if len == 0 { break; }
-            digest.update(&self.buf[..len]);
-            uncompressed_size += len as u64;
-
-            let mut in_buf = &self.buf[..len];
-            loop {
-                let res = deflate(&mut compressor, in_buf, &mut self.compressed_buf, MZFlush::None);
-                match res.status {
-                    Ok(MZStatus::Ok) => (),
-                    Ok(status) => return Err(Error::new(ErrorKind::Other, format!("deflate unexpected status: {:?}", status))),
-                    Err(status) => return Err(Error::new(ErrorKind::Other, format!("deflate error: {:?}", status))),
+    pub fn add_file<R: Read>(&mut self, name: Vec<u8>, last_modified: NaiveDateTime, compression: CompressionMode, content: &mut R, use_zip64: bool) -> Result<()> {
+        self.start_new_file(name, last_modified, compression, use_zip64)?;
+        let mut buf = [0; 4096];
+        match compression {
+            CompressionMode::Store => {
+                while let Ok(bytes_read) = content.read(&mut buf) {
+                    if bytes_read == 0 { break; }
+                    self.append_data_store(&buf[..bytes_read])?;
                 }
-
-                compressed_size += res.bytes_written as u64;
-                self.inner.write_all(&self.compressed_buf[..res.bytes_written])?;
-                self.written += res.bytes_written;
-                in_buf = &in_buf[res.bytes_consumed..];
-                if in_buf.len() == 0 { break; }
+            },
+            CompressionMode::Deflate(_) => {
+                while let Ok(bytes_read) = content.read(&mut buf) {
+                    if bytes_read == 0 { break; }
+                    self.append_data_deflate(&buf[..bytes_read])?;
+                }
             }
         }
-
-        loop {
-            let res = deflate(&mut compressor, &[], &mut self.compressed_buf, MZFlush::Finish);
-            let status = match res.status {
-                Ok(MZStatus::Ok) => MZStatus::Ok,
-                Ok(MZStatus::StreamEnd) => MZStatus::StreamEnd,
-                Ok(status) => return Err(Error::new(ErrorKind::Other, format!("deflate unexpected status: {:?}", status))),
-                Err(status) => return Err(Error::new(ErrorKind::Other, format!("deflate error: {:?}", status))),
-            };
-            compressed_size += res.bytes_written as u64;
-            self.inner.write_all(&self.compressed_buf[..res.bytes_written])?;
-            self.written += res.bytes_written;
-            if let MZStatus::StreamEnd = status { break; }
-        }
-
-        let crc = digest.finalize();
-        Ok(DataDescriptor {
-            crc,
-            uncompressed_size,
-            compressed_size,
-        })
-    }
-
-    fn write_data_store<R: Read>(&mut self, content: &mut R) -> Result<DataDescriptor> {
-        let mut digest = CRC32.digest();
-        let mut uncompressed_size = 0u64;
-        while let Ok(len) = content.read(&mut self.buf) {
-            if len == 0 { break; }
-            digest.update(&self.buf[..len]);
-            uncompressed_size += len as u64;
-            self.inner.write_all(&self.buf[..len])?;
-            self.written += len;
-        }
-        let crc = digest.finalize();
-        Ok(DataDescriptor {
-            crc,
-            uncompressed_size,
-            compressed_size: uncompressed_size,
-        })
-    }
-
-    pub fn add_file<R: Read>(&mut self, name: Vec<u8>, last_modified: NaiveDateTime, compression: CompressionMode, content: &mut R, use_zip64: bool) -> Result<()> {
-        let mut file = FileHeader {
-            name,
-            last_modified,
-            data_descriptor: None,
-            file_header_start: self.written as u64,
-            compression,
-            is_zip64: use_zip64 || self.written > (u32::MAX as usize)
-        };
-        self.written += file.write(&mut self.inner, false)?;
-
-        let dd = match compression {
-            CompressionMode::Store => self.write_data_store(content)?,
-            CompressionMode::Deflate(level) => self.write_data_deflate(content, level)?,
-        };
-
-        self.written += dd.write(&mut self.inner, true, use_zip64, false)?;
-        file.data_descriptor = Some(dd);
-
-        self.files.push(file);
+        self.finish_file()?;
 
         Ok(())
     }
