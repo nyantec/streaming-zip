@@ -25,12 +25,12 @@ const CRC32: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 #[derive(Debug, Clone, Default)]
 struct DataDescriptor {
     crc: u32,
-    compressed_size: u32,
-    uncompressed_size: u32,
+    compressed_size: u64,
+    uncompressed_size: u64,
 }
 
 impl DataDescriptor {
-    fn write<W: Write>(&self, handle: &mut W, with_signature: bool) -> Result<usize> {
+    fn write<W: Write>(&self, handle: &mut W, with_signature: bool, u64_fields: bool, is_zip64: bool) -> Result<usize> {
         let mut written = 0;
         if with_signature {
             handle.write_all(b"PK\x07\x08")?; // data descriptor signature
@@ -38,10 +38,22 @@ impl DataDescriptor {
         }
         handle.write_all(&self.crc.to_le_bytes())?;
         written += 4;
-        handle.write_all(&self.compressed_size.to_le_bytes())?;
-        written += 4;
-        handle.write_all(&self.uncompressed_size.to_le_bytes())?;
-        written += 4;
+        if u64_fields {
+            handle.write_all(&self.compressed_size.to_le_bytes())?;
+            written += 8;
+            handle.write_all(&self.uncompressed_size.to_le_bytes())?;
+            written += 8;
+        } else if is_zip64 {
+            handle.write_all(&u32::MAX.to_le_bytes())?;
+            written += 4;
+            handle.write_all(&u32::MAX.to_le_bytes())?;
+            written += 4;
+        } else {
+            handle.write_all(&(self.compressed_size as u32).to_le_bytes())?;
+            written += 4;
+            handle.write_all(&(self.uncompressed_size as u32).to_le_bytes())?;
+            written += 4;
+        }
         Ok(written)
     }
 }
@@ -51,8 +63,9 @@ struct FileHeader {
     name: Vec<u8>,
     last_modified: NaiveDateTime,
     data_descriptor: Option<DataDescriptor>,
-    file_header_start: u32,
+    file_header_start: u64,
     compression: CompressionMode,
+    is_zip64: bool
 }
 
 impl FileHeader {
@@ -66,11 +79,21 @@ impl FileHeader {
             written += 4;
         }
         if is_central {
-            handle.write_all(&10u16.to_le_bytes())?; // Version made by => 1.0
+            if self.is_zip64 {
+                handle.write_all(&45u16.to_le_bytes())?; // Version made by => 4.5
+                written += 2;
+            } else {
+                handle.write_all(&10u16.to_le_bytes())?; // Version made by => 1.0
+                written += 2;
+            }
+        }
+        if self.is_zip64 {
+            handle.write_all(&45u16.to_le_bytes())?; // Version needed to extract (minimum) => 4.5
+            written += 2;
+        } else {
+            handle.write_all(&10u16.to_le_bytes())?; // Version needed to extract (minimum) => 1.0
             written += 2;
         }
-        handle.write_all(&10u16.to_le_bytes())?; // Version needed to extract (minimum) => 1.0
-        written += 2;
         handle.write_all(&0b0000_1000u16.to_le_bytes())?; // General purpose bit flag => enable data descriptor
         written += 2;
         let compression_num: u16 = match self.compression {
@@ -85,11 +108,16 @@ impl FileHeader {
         written += 2;
         handle.write_all(&datepart.to_le_bytes())?; // File last modification date
         written += 2;
-        written += self.data_descriptor.clone().unwrap_or_default().write(handle, false)?;
+        written += self.data_descriptor.clone().unwrap_or_default().write(handle, false, false, self.is_zip64)?;
         handle.write_all(&(self.name.len() as u16).to_le_bytes())?; // File name length
         written += 2;
-        handle.write_all(&0u16.to_le_bytes())?; // Extra field length
-        written += 2;
+        if self.is_zip64 {
+            handle.write_all(&28u16.to_le_bytes())?; // Extra field length
+            written += 2;
+        } else {
+            handle.write_all(&0u16.to_le_bytes())?; // Extra field length
+            written += 2;
+        }
         if is_central {
             handle.write_all(&0u16.to_le_bytes())?; // File comment length
             written += 2;
@@ -99,11 +127,29 @@ impl FileHeader {
             written += 2;
             handle.write_all(&0u32.to_le_bytes())?; // External file attributes
             written += 4;
-            handle.write_all(&self.file_header_start.to_le_bytes())?; // Relative offset of local file header
-            written += 4;
+            if self.is_zip64 {
+                handle.write_all(&u32::MAX.to_le_bytes())?; // Relative offset of local file header
+                written += 4;
+            } else {
+                handle.write_all(&(self.file_header_start as u32).to_le_bytes())?; // Relative offset of local file header
+                written += 4;
+            }
         }
         handle.write_all(&self.name)?; // File name
         written += self.name.len();
+        if self.is_zip64 {
+            handle.write_all(&1u16.to_le_bytes())?; // Extra field header
+            written += 2;
+            handle.write_all(&24u16.to_le_bytes())?; // Size of the extra field chunk
+            written += 2;
+            let dd = self.data_descriptor.clone().unwrap_or_default();
+            handle.write_all(&dd.uncompressed_size.to_le_bytes())?; // Original uncompressed file size
+            written += 8;
+            handle.write_all(&dd.compressed_size.to_le_bytes())?; // Size of compressed data
+            written += 8;
+            handle.write_all(&self.file_header_start.to_le_bytes())?; // Offset of local header record
+            written += 8;
+        }
         Ok(written)
     }
 }
@@ -137,12 +183,12 @@ impl<W: Write> Archive<W> {
         let mut compressor = CompressorOxide::default();
         compressor.set_format_and_level(DataFormat::Raw, level);
         let mut digest = CRC32.digest();
-        let mut uncompressed_size = 0u32;
-        let mut compressed_size = 0u32;
+        let mut uncompressed_size = 0u64;
+        let mut compressed_size = 0u64;
         while let Ok(len) = content.read(&mut self.buf) {
             if len == 0 { break; }
             digest.update(&self.buf[..len]);
-            uncompressed_size += len as u32;
+            uncompressed_size += len as u64;
 
             let mut in_buf = &self.buf[..len];
             loop {
@@ -153,7 +199,7 @@ impl<W: Write> Archive<W> {
                     Err(status) => return Err(Error::new(ErrorKind::Other, format!("deflate error: {:?}", status))),
                 }
 
-                compressed_size += res.bytes_written as u32;
+                compressed_size += res.bytes_written as u64;
                 self.inner.write_all(&self.compressed_buf[..res.bytes_written])?;
                 self.written += res.bytes_written;
                 in_buf = &in_buf[res.bytes_consumed..];
@@ -169,7 +215,7 @@ impl<W: Write> Archive<W> {
                 Ok(status) => return Err(Error::new(ErrorKind::Other, format!("deflate unexpected status: {:?}", status))),
                 Err(status) => return Err(Error::new(ErrorKind::Other, format!("deflate error: {:?}", status))),
             };
-            compressed_size += res.bytes_written as u32;
+            compressed_size += res.bytes_written as u64;
             self.inner.write_all(&self.compressed_buf[..res.bytes_written])?;
             self.written += res.bytes_written;
             if let MZStatus::StreamEnd = status { break; }
@@ -185,11 +231,11 @@ impl<W: Write> Archive<W> {
 
     fn write_data_store<R: Read>(&mut self, content: &mut R) -> Result<DataDescriptor> {
         let mut digest = CRC32.digest();
-        let mut uncompressed_size = 0u32;
+        let mut uncompressed_size = 0u64;
         while let Ok(len) = content.read(&mut self.buf) {
             if len == 0 { break; }
             digest.update(&self.buf[..len]);
-            uncompressed_size += len as u32;
+            uncompressed_size += len as u64;
             self.inner.write_all(&self.buf[..len])?;
             self.written += len;
         }
@@ -201,13 +247,14 @@ impl<W: Write> Archive<W> {
         })
     }
 
-    pub fn add_file<R: Read>(&mut self, name: Vec<u8>, last_modified: NaiveDateTime, compression: CompressionMode, content: &mut R) -> Result<()> {
+    pub fn add_file<R: Read>(&mut self, name: Vec<u8>, last_modified: NaiveDateTime, compression: CompressionMode, content: &mut R, use_zip64: bool) -> Result<()> {
         let mut file = FileHeader {
             name,
             last_modified,
             data_descriptor: None,
-            file_header_start: self.written as u32,
+            file_header_start: self.written as u64,
             compression,
+            is_zip64: use_zip64 || self.written > (u32::MAX as usize)
         };
         self.written += file.write(&mut self.inner, false)?;
 
@@ -216,7 +263,7 @@ impl<W: Write> Archive<W> {
             CompressionMode::Deflate(level) => self.write_data_deflate(content, level)?,
         };
 
-        self.written += dd.write(&mut self.inner, true)?;
+        self.written += dd.write(&mut self.inner, true, use_zip64, false)?;
         file.data_descriptor = Some(dd);
 
         self.files.push(file);
@@ -224,14 +271,14 @@ impl<W: Write> Archive<W> {
         Ok(())
     }
 
-    pub fn add_file_from_path<R: AsRef<Path>, S: AsRef<Path>>(&mut self, path: R, src_path: S, compression: CompressionMode) -> Result<()> {
+    pub fn add_file_from_path<R: AsRef<Path>, S: AsRef<Path>>(&mut self, path: R, src_path: S, compression: CompressionMode, use_zip64: bool) -> Result<()> {
         let mut file = File::open(src_path)?;
         let modified = DateTime::<Utc>::from(file.metadata()?.modified()?).naive_local();
-        self.add_file(path.as_ref().to_path_buf().into_os_string().into_vec(), modified, compression, &mut file)?;
+        self.add_file(path.as_ref().to_path_buf().into_os_string().into_vec(), modified, compression, &mut file, use_zip64)?;
         Ok(())
     }
 
-    pub fn add_dir_all<R: AsRef<Path>, S: AsRef<Path>>(&mut self, path: R, src_path: S, compression: CompressionMode) -> Result<()> {
+    pub fn add_dir_all<R: AsRef<Path>, S: AsRef<Path>>(&mut self, path: R, src_path: S, compression: CompressionMode, use_zip64: bool) -> Result<()> {
         let mut stack = vec![(src_path.as_ref().to_path_buf(), None)];
         while let Some((src, modified_if_file)) = stack.pop() {
             let dest = path.as_ref().join(src.strip_prefix(&src_path).unwrap());
@@ -250,7 +297,7 @@ impl<W: Write> Archive<W> {
                     }
                 },
                 Some(modified) => {
-                    self.add_file(dest.into_os_string().into_vec(), modified, compression, &mut File::open(src)?)?;
+                    self.add_file(dest.into_os_string().into_vec(), modified, compression, &mut File::open(src)?, use_zip64)?;
                 },
             }
         }
@@ -258,20 +305,57 @@ impl<W: Write> Archive<W> {
     }
 
     pub fn finish(mut self) -> Result<W> {
+        let mut is_zip64 = self.files.len() > u16::MAX.into();
         let central_directory_start = self.written;
         for file in &self.files {
             self.written += file.write(&mut self.inner, true)?;
+            if file.is_zip64 {
+                is_zip64 = true
+            }
         }
         let central_directory_size = self.written - central_directory_start;
 
-        self.inner.write_all(b"PK\x05\x06")?; // End of central directory signature
-        self.inner.write_all(&0u16.to_le_bytes())?; // Number of this disk
-        self.inner.write_all(&0u16.to_le_bytes())?; // Disk where central directory starts
-        self.inner.write_all(&(self.files.len() as u16).to_le_bytes())?; // Number of central directory records on this disk
-        self.inner.write_all(&(self.files.len() as u16).to_le_bytes())?; // Total number of central directory records
-        self.inner.write_all(&(central_directory_size as u32).to_le_bytes())?; // Size of central directory
-        self.inner.write_all(&(central_directory_start as u32).to_le_bytes())?; // Offset of start of central directory
-        self.inner.write_all(&0u16.to_le_bytes())?; // Comment length
+        if is_zip64 {
+            self.inner.write_all(b"PK\x06\x06")?; // Zip64 end of central directory signature
+            self.inner.write_all(&44u64.to_le_bytes())?; // Size of EOCD64 minus 12
+            self.inner.write_all(&45u16.to_le_bytes())?; // Version made by
+            self.inner.write_all(&45u16.to_le_bytes())?; // Version needed to extract (minimum)
+            self.inner.write_all(&0u32.to_le_bytes())?; // Number of this disk
+            self.inner.write_all(&0u32.to_le_bytes())?; // Disk where central directory starts
+            self.inner.write_all(&(self.files.len() as u64).to_le_bytes())?; // Number of central directory records on this disk
+            self.inner.write_all(&(self.files.len() as u64).to_le_bytes())?; // Total number of central directory records
+            self.inner.write_all(&(central_directory_size as u64).to_le_bytes())?; // Size of central directory
+            self.inner.write_all(&(central_directory_start as u64).to_le_bytes())?; // Offset of start of central directory
+
+            self.inner.write_all(b"PK\x06\x07")?; // Zip64 end of central directory locator signature
+            self.inner.write_all(&0u32.to_le_bytes())?; // Number of the disk with the start of the Zip64 end of central directory record
+            self.inner.write_all(&(self.written as u64).to_le_bytes())?; // Relative offset of the Zip64 end of central directory record
+            self.inner.write_all(&1u32.to_le_bytes())?; // Total number of disks
+
+            self.inner.write_all(b"PK\x05\x06")?; // End of central directory signature
+            self.inner.write_all(&u16::MAX.to_le_bytes())?; // Number of this disk
+            self.inner.write_all(&u16::MAX.to_le_bytes())?; // Disk where central directory starts
+            if self.files.len() > (u16::MAX as usize) {
+                self.inner.write_all(&u16::MAX.to_le_bytes())?; // Number of central directory records on this disk
+                self.inner.write_all(&u16::MAX.to_le_bytes())?; // Total number of central directory records
+            } else {
+                self.inner.write_all(&(self.files.len() as u16).to_le_bytes())?; // Number of central directory records on this disk
+                self.inner.write_all(&(self.files.len() as u16).to_le_bytes())?; // Total number of central directory records
+            }
+            self.inner.write_all(&u32::MAX.to_le_bytes())?; // Size of central directory
+            self.inner.write_all(&u32::MAX.to_le_bytes())?; // Offset of start of central directory
+            self.inner.write_all(&0u16.to_le_bytes())?; // Comment length
+
+        } else {
+            self.inner.write_all(b"PK\x05\x06")?; // End of central directory signature
+            self.inner.write_all(&0u16.to_le_bytes())?; // Number of this disk
+            self.inner.write_all(&0u16.to_le_bytes())?; // Disk where central directory starts
+            self.inner.write_all(&(self.files.len() as u16).to_le_bytes())?; // Number of central directory records on this disk
+            self.inner.write_all(&(self.files.len() as u16).to_le_bytes())?; // Total number of central directory records
+            self.inner.write_all(&(central_directory_size as u32).to_le_bytes())?; // Size of central directory
+            self.inner.write_all(&(central_directory_start as u32).to_le_bytes())?; // Offset of start of central directory
+            self.inner.write_all(&0u16.to_le_bytes())?; // Comment length
+        }
 
         Ok(self.inner)
     }
